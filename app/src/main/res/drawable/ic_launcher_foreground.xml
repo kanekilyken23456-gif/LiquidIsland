@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Cahaya ungu di sekitar kapsul -->
+    <path android:fillColor="#142E1F5C" android:pathData="M33.1,43.8 H76.6 A9.7,9.7 0 0 1 76.6,63.2 H33.1 A9.7,9.7 0 0 1 33.1,43.8 Z" />
+    <path android:fillColor="#242E1F5C" android:pathData="M33.1,44.7 H76.6 A8.8,8.8 0 0 1 76.6,62.3 H33.1 A8.8,8.8 0 0 1 33.1,44.7 Z" />
+    <path android:fillColor="#40513A9A" android:pathData="M33.1,45.4 H76.6 A8.1,8.1 0 0 1 76.6,61.6 H33.1 A8.1,8.1 0 0 1 33.1,45.4 Z" />
+    <!-- Kapsul -->
+    <path
+        android:fillColor="#FF000000"
+        android:strokeColor="#FF8B63E0"
+        android:strokeWidth="0.4"
+        android:pathData="M33.1,46 H76.6 A7.5,7.5 0 0 1 76.6,61 H33.1 A7.5,7.5 0 0 1 33.1,46 Z" />
+    <!-- Titik -->
+    <path android:fillColor="#FFA07BFA" android:pathData="M30.8,53.7 a2.5,2.5 0 1 0 5,0 a2.5,2.5 0 1 0 -5,0 Z" />
+    <path android:strokeColor="#FF4E4471" android:strokeWidth="1.5" android:strokeLineCap="round"
+        android:pathData="M70.0,53.20 V54.20" />
+    <path android:strokeColor="#FF61538B" android:strokeWidth="1.5" android:strokeLineCap="round"
+        android:pathData="M72.4,52.30 V55.10" />
+    <path android:strokeColor="#FF846FC1" android:strokeWidth="1.5" android:strokeLineCap="round"
+        android:pathData="M74.8,51.35 V56.05" />
+    <path android:strokeColor="#FFA58CF5" android:strokeWidth="1.5" android:strokeLineCap="round"
+        android:pathData="M77.2,49.75 V57.65" />
+    <path android:strokeColor="#FF6B57A9" android:strokeWidth="1.5" android:strokeLineCap="round"
+        android:pathData="M79.7,51.35 V56.05" />
+</vector>

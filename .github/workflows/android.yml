@@ -1,0 +1,233 @@
+name: Сборка APK
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Сборка только читает репозиторий: Gradle и его зависимости не получают права на запись.
+# Писать (выпускать релиз) может только отдельная задача ниже, и только на основной ветке или теге.
+permissions:
+  contents: read
+
+# Отпечаток сертификата, которым подписан остров с 1.6.1. Если секрет подменят другим ключом,
+# сборка остановится: иначе у всех перестали бы ставиться обновления.
+# [FORK] Kalau fork pakai keystore sendiri: buat repo variable SIGNING_CERT_SHA256 (Settings > Secrets and
+# variables > Actions > Variables) berisi SHA-256 sertifikat keystore kamu. Kalau kosong, dipakai nilai bawaan upstream.
+env:
+  SIGNING_CERT_SHA256: ${{ vars.SIGNING_CERT_SHA256 || 'c691aa99b1d38518d066066fcb31664374f6a21d65180f7c0565c37a073a12dd' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      release: ${{ steps.ver.outputs.release }}
+      update: ${{ steps.ver.outputs.update }}
+      signed: ${{ steps.sign.outputs.signed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      # Релиз выходит сам, когда в app/build.gradle.kts повышают versionName
+      # (или когда пушат тег v*). Описание на двух языках: CHANGELOG.en.md и CHANGELOG.md.
+      # Если релиз этой версии уже есть, push в основную ветку обновляет его описание.
+      - name: Версия
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          v=$(grep -oP 'versionName = "\K[0-9A-Za-z.\-]+(?=")' app/build.gradle.kts)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tag="$GITHUB_REF_NAME"; else tag="v$v"; fi
+          # Тег идёт в имя релиза и в команды — только буквы, цифры, точки и дефисы
+          if [[ ! "$tag" =~ ^v[0-9A-Za-z.\-]+$ ]]; then echo "Странный тег: $tag" >&2; exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          exists=false
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && exists=true
+          release=false
+          update=false
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            release=true
+          elif [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]]; then
+            if [[ "$exists" == true ]]; then update=true; else release=true; fi
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "update=$update" >> "$GITHUB_OUTPUT"
+
+      # [FORK] Bit eksekusi gradlew hilang kalau file diupload lewat web GitHub / dari zip / dari Windows,
+      # hasilnya "./gradlew: Permission denied" (exit code 126). chmod di sini membuat build tidak
+      # bergantung pada mode file di git.
+      - name: Izin eksekusi gradlew
+        run: chmod +x gradlew
+
+      # Gradle собирает APK без подписи: ключ ему не нужен, и сторонний код сборки его не увидит
+      - name: Сборка
+        run: ./gradlew --no-daemon --max-workers=4 testDebugUnitTest lintDebug assembleRelease
+
+      # Подпись — отдельным шагом: ключ из секретов есть только здесь и сразу удаляется
+      # [FORK] Langkah ini tidak lagi menghentikan build. Urutannya:
+      #   1. Ada secret KEYSTORE_BASE64 + KEYSTORE_PASSWORD -> dipakai. Alias dan tipe keystore (JKS/PKCS12)
+      #      dideteksi otomatis (atau isi secret/variable KEYSTORE_ALIAS). Password key = KEYSTORE_KEY_PASSWORD
+      #      kalau diisi, kalau tidak sama dengan KEYSTORE_PASSWORD.
+      #   2. Keystore bermasalah / tidak ada -> APK ditandatangani kunci SEMENTARA (acak tiap build, hanya
+      #      untuk testing, tidak bisa di-update dari build lain). Alasannya tertulis di log.
+      # APK selalu diupload sebagai artifact. Rilis ke GitHub Releases hanya kalau APK ditandatangani kunci
+      # yang SHA-256 sertifikatnya sama dengan SIGNING_CERT_SHA256.
+      - name: Подпись
+        id: sign
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
+          KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS || vars.KEYSTORE_ALIAS }}
+        run: |
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $bt"
+          mkdir -p out
+          ks="$RUNNER_TEMP/island.keystore"
+          trap 'rm -f "$ks"' EXIT
+          "$bt/zipalign" -f 4 app/build/outputs/apk/release/app-release-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+
+          key_kind=""   # real = keystore dari secret, temp = kunci sementara
+
+          use_secret_key() {
+            printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$ks" 2>/dev/null || {
+              echo "::warning::KEYSTORE_BASE64 bukan base64 yang valid"; return 1; }
+            [[ -s "$ks" ]] || { echo "::warning::KEYSTORE_BASE64 kosong setelah didecode"; return 1; }
+            local info ks_type want alias_name="" fp="" a f
+            # keytool menulis pesan error ke stdout, jadi hasilnya ditampilkan kalau gagal
+            if ! info=$(keytool -J-Duser.language=en -list -v -keystore "$ks" -storepass:env KEYSTORE_PASSWORD 2>&1); then
+              echo "$info"
+              echo "::warning::keytool tidak bisa membuka keystore dari secret (password salah atau file bukan keystore), lihat pesan di atas"
+              return 1
+            fi
+            ks_type=$(awk '/^Keystore type:/ {sub(/^Keystore type: */, ""); print; exit}' <<<"$info")
+            want="${KEYSTORE_ALIAS:-island}"
+            while IFS=$'\t' read -r a f; do
+              [[ -n "$a" ]] || continue
+              if [[ -z "$alias_name" || "${a,,}" == "${want,,}" ]]; then alias_name="$a"; fp="$f"; fi
+              if [[ "${a,,}" == "${want,,}" ]]; then break; fi
+            done < <(awk '
+              /^Alias name:/ {a=$0; sub(/^Alias name: */, "", a); pk=0}
+              /^Entry type:/ {pk = ($0 ~ /PrivateKeyEntry/)}
+              /SHA256:/ {if (pk && a != "" && !seen[a]++) {f=$0; sub(/.*SHA256: */, "", f); gsub(":", "", f); print a "\t" tolower(f)}}
+            ' <<<"$info")
+            if [[ -z "$alias_name" ]]; then
+              echo "$info"
+              echo "::warning::Keystore dari secret tidak punya entri kunci privat (PrivateKeyEntry)"
+              return 1
+            fi
+            echo "keystore dari secret: tipe=${ks_type:-?} alias=$alias_name sha256=$fp"
+            export KEY_PASSWORD="${KEYSTORE_KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+            local out
+            if ! out=$("$bt/apksigner" sign --ks "$ks" --ks-type "${ks_type:-PKCS12}" --ks-key-alias "$alias_name" \
+                --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD \
+                --out out/DynamicIsland.apk "$RUNNER_TEMP/aligned.apk" 2>&1); then
+              echo "$out"
+              echo "::warning::apksigner gagal dengan keystore dari secret. Kalau password key berbeda dari password keystore, isi secret KEYSTORE_KEY_PASSWORD"
+              rm -f out/DynamicIsland.apk
+              return 1
+            fi
+            key_kind=real
+          }
+
+          use_temp_key() {
+            export TMP_KEY_PASSWORD="android-temp-key"
+            rm -f "$ks" out/DynamicIsland.apk
+            keytool -genkeypair -keystore "$ks" -storetype PKCS12 -alias island \
+              -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=Dynamic Island Fork Test" \
+              -storepass:env TMP_KEY_PASSWORD -keypass:env TMP_KEY_PASSWORD
+            "$bt/apksigner" sign --ks "$ks" --ks-type PKCS12 --ks-key-alias island \
+              --ks-pass env:TMP_KEY_PASSWORD --key-pass env:TMP_KEY_PASSWORD \
+              --out out/DynamicIsland.apk "$RUNNER_TEMP/aligned.apk"
+            key_kind=temp
+          }
+
+          if [[ -n "$KEYSTORE_BASE64" && -n "$KEYSTORE_PASSWORD" ]]; then
+            use_secret_key || true
+          else
+            echo "::warning::Secret KEYSTORE_BASE64 / KEYSTORE_PASSWORD tidak ada"
+          fi
+          if [[ -z "$key_kind" ]]; then
+            echo "::warning::APK ditandatangani kunci SEMENTARA: hanya untuk testing, tidak dirilis, tidak bisa di-update dari build lain"
+            use_temp_key
+          fi
+
+          # Проверяем, что APK подписан (сертификат не секрет, его видно в логе)
+          certs=$("$bt/apksigner" verify --verbose --print-certs out/DynamicIsland.apk)
+          echo "$certs"
+          echo "built=true" >> "$GITHUB_OUTPUT"
+          signed=false
+          if [[ "$key_kind" == real ]]; then
+            got=$(awk 'tolower($0) ~ /certificate sha-256 digest:/ {print tolower($NF); exit}' <<<"$certs")
+            if [[ "$got" == "${SIGNING_CERT_SHA256,,}" ]]; then
+              signed=true
+            else
+              echo "::warning::APK ditandatangani kunci milikmu (SHA-256 $got), bukan kunci resmi upstream, jadi tidak dirilis ke GitHub Releases. APK tetap ada di artifact. Untuk rilis otomatis, buat repo variable SIGNING_CERT_SHA256 berisi $got"
+            fi
+          fi
+          echo "signed=$signed" >> "$GITHUB_OUTPUT"
+
+      # Тестовые APK лежат неделю: потом пропадают сами, а версии для всех — в релизах
+      - uses: actions/upload-artifact@v5
+        if: steps.sign.outputs.built == 'true'
+        with:
+          name: DynamicIsland-apk
+          path: out/DynamicIsland.apk
+          retention-days: 7
+
+  release:
+    needs: build
+    if: needs.build.outputs.signed == 'true' && (needs.build.outputs.release == 'true' || needs.build.outputs.update == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: DynamicIsland-apk
+          path: out
+
+      - name: Описание релиза из CHANGELOG.en.md и CHANGELOG.md
+        run: |
+          v="${TAG#v}"
+          section() { awk -v v="$v" 'index($0, "## [" v "]") == 1 {f=1; next} /^## \[/ {f=0} f' "$1"; }
+          {
+            echo "## 🇬🇧 English"
+            section CHANGELOG.en.md
+            printf '\n**Install:** download `DynamicIsland.apk` below and open it on your phone. A new version installs over the old one, your settings are kept. **Coming from 1.6.0 or older:** uninstall the old version first — once, because the app now has a new signing key.\n\n---\n\n'
+            echo "## 🇷🇺 Русский"
+            section CHANGELOG.md
+            printf '\n**Установка:** скачайте `DynamicIsland.apk` ниже и откройте на телефоне. Новая версия ставится поверх старой, настройки сохраняются. **С версии 1.6.0 и старше:** сначала удалите старую версию — один раз, потому что у приложения новый ключ подписи.\n'
+          } > notes.md
+          cat notes.md
+
+      # Релиз выпускает сам gh — без сторонних действий, которым пришлось бы доверить право на запись
+      - name: Релиз
+        if: needs.build.outputs.release == 'true'
+        run: |
+          gh release create "$TAG" out/DynamicIsland.apk -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Dynamic Island $TAG · Динамический остров" --notes-file notes.md --latest
+
+      - name: Обновить описание вышедшего релиза
+        if: needs.build.outputs.update == 'true'
+        run: |
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes-file notes.md --title "Dynamic Island $TAG · Динамический остров"

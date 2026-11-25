@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Recommended LSPosed scope: only SystemUI. The module hooks nothing in the island app itself.
+        - com.android.systemui → status-bar icon hiding, fullscreen/immersive and shade/QS detection
+    -->
+    <string-array name="xposed_scope">
+        <item>com.android.systemui</item>
+    </string-array>
+</resources>
